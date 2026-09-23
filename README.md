@@ -191,6 +191,14 @@ drops back to `dndmic`, and hanging up entirely sets `busy`.
   those apps keep the input open.
 - It overrides any mode you set by hand on the next camera/mic change.
 
+### Downloading the `ble-client` instead of building locally
+- If downloading the artifact from the repo macOS will quarantine it for safety.
+Can remove the quarantine bit with `sudo xattr -c ~/Downloads/ble-client`.
+- Make the client executable with `chmod +x ~/Downloads/ble-client`
+- Optionally move the client to a folder in the `$PATH`. I usually do `mv ~/Downloads/ble-client ~/.local/bin`
+- Can have it run in the background with `nohup ble-client watch -api-key <EMBEDDED-API-KEY> > ~/Downloads/ble-watch.log 2>&1 &`
+- **Note**: first time you run the binari and sends commands over Bluetooth, you have to allow the Terminal to do it!
+
 ## Notes
 
 - Brightness is capped in firmware at `LED_MAX_BRIGHTNESS` (currently 40 of
