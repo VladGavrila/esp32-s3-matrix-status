@@ -157,6 +157,40 @@ command, prints the resulting status, then disconnects — no need to keep a
 connection open between commands. `-wifi` mode is a thinner wrapper: it
 just issues the same HTTP requests documented above with `curl`.
 
+### Following your camera and mic (macOS)
+
+`ble-client watch` runs until you stop it (Ctrl-C). It follows this Mac's
+camera and microphone and sets the mode to match:
+
+| Camera | Mic     | Mode     |
+|--------|---------|----------|
+| in use | any     | `dnd`    |
+| off    | in use  | `dndmic` |
+| off    | off     | `busy`   |
+
+So a video call shows `dnd`. Turning the camera off with the mic still open
+drops back to `dndmic`, and hanging up entirely sets `busy`.
+
+```bash
+./ble-client watch                 # over BLE
+./ble-client watch -wifi           # over WiFi/HTTP
+./ble-client watch -dry-run        # just log what it would send
+```
+
+- It checks every `-interval` (default 1s). A new state has to hold for
+  `-settle` (default 2s) before it's sent, so the mic turning on a moment
+  before the camera at the start of a call doesn't flash `dndmic` first.
+- It only sends when the mode changes, and it sends the current mode once
+  at startup. If a send fails (device out of range, WiFi down), it retries
+  every 5s until one succeeds.
+- It reads the same signals as the green/orange menu-bar indicators:
+  CoreMediaIO for cameras (built-in, USB, Continuity Camera, virtual) and
+  CoreAudio's per-process input state for the mic. No camera or mic
+  permission is needed, since it never opens the devices itself.
+- A muted mic in Zoom/Teams/Meet usually still counts as in use, because
+  those apps keep the input open.
+- It overrides any mode you set by hand on the next camera/mic change.
+
 ## Notes
 
 - Brightness is capped in firmware at `LED_MAX_BRIGHTNESS` (currently 40 of

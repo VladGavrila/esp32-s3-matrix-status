@@ -9,11 +9,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"tinygo.org/x/bluetooth"
@@ -55,6 +57,8 @@ func main() {
 		runBrightness(os.Args[2:])
 	case "mode":
 		runMode(os.Args[2:])
+	case "watch":
+		runWatch(os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -70,6 +74,7 @@ Usage:
   ble-client color <r> <g> <b> [-brightness N] [-wifi] [-host HOST] [-timeout D] [-api-key KEY]
   ble-client brightness <level> [-wifi] [-host HOST] [-timeout D] [-api-key KEY]
   ble-client mode <busy|dnd|free|dndmic|test|off> [-wifi] [-host HOST] [-timeout D] [-api-key KEY]
+  ble-client watch [-interval D] [-settle D] [-dry-run] [-wifi] [-host HOST] [-timeout D] [-api-key KEY]
 
 By default, commands are sent over BLE. Pass -wifi to send them over the
 HTTP API instead (to the device at -host, default "VGS3A.local").
@@ -77,6 +82,9 @@ HTTP API instead (to the device at -host, default "VGS3A.local").
 -timeout sets how long to wait for the device (BLE scan, or the HTTP
 request) before giving up. Default 3s; accepts durations like "500ms" or
 "10s".
+
+watch (macOS only) runs until interrupted, following this Mac's camera and
+microphone: camera in use -> dnd, mic only -> dndmic, neither -> busy.
 
 API key defaults to the MATRIX_API_KEY environment variable.`)
 }
@@ -219,6 +227,73 @@ func runMode(args []string) {
 	must(sendCommand(*t.apiKey, "mode", name, *t.wifi, *t.host, *t.timeout))
 }
 
+const watchRetryDelay = 5 * time.Second
+
+// watchMode picks the mode for the current capture state. The camera wins
+// over the mic, and idle falls back to busy rather than free.
+func watchMode(camera, mic bool) string {
+	switch {
+	case camera:
+		return "dnd"
+	case mic:
+		return "dndmic"
+	default:
+		return "busy"
+	}
+}
+
+func runWatch(args []string) {
+	fs := newFlagSet("watch")
+	t := addTransportFlags(fs)
+	interval := fs.Duration("interval", time.Second, "how often to check camera/mic state")
+	settle := fs.Duration("settle", 2*time.Second, "how long a new state must hold before it's sent")
+	dryRun := fs.Bool("dry-run", false, "log mode changes without sending them")
+	fs.Parse(reorderArgs(fs, args))
+
+	if len(fs.Args()) != 0 {
+		fatal("usage: ble-client watch [-interval D] [-settle D] [-dry-run]")
+	}
+	if !*dryRun {
+		requireAPIKey(*t.apiKey)
+	}
+
+	// sent is the last mode the device accepted; candidate is what the
+	// camera/mic currently call for, and must hold for -settle before it's
+	// sent (calls often flick the mic on a moment before the camera).
+	var sent, candidate string
+	var candidateSince, nextAttempt time.Time
+
+	ticker := time.NewTicker(*interval)
+	defer ticker.Stop()
+	for ; ; <-ticker.C {
+		camera, mic, err := captureState()
+		if err != nil {
+			log.Print(err)
+			continue
+		}
+
+		now := time.Now()
+		if mode := watchMode(camera, mic); mode != candidate {
+			candidate, candidateSince = mode, now
+		}
+		if candidate == sent || now.Sub(candidateSince) < *settle || now.Before(nextAttempt) {
+			continue
+		}
+
+		log.Printf("camera=%v mic=%v -> mode %s", camera, mic, candidate)
+		if *dryRun {
+			sent = candidate
+			continue
+		}
+		if err := sendCommand(*t.apiKey, "mode", candidate, *t.wifi, *t.host, *t.timeout); err != nil {
+			log.Printf("sending mode %s failed: %v (retrying in %s)", candidate, err, watchRetryDelay)
+			nextAttempt = now.Add(watchRetryDelay)
+			continue
+		}
+		sent = candidate
+	}
+}
+
 // sendCommand dispatches to the BLE or HTTP transport. command/args use
 // the same shape either way: command is "color", "brightness", or "mode",
 // and args is "r,g,b[,brightness]", a brightness level, or a mode name.
@@ -335,11 +410,19 @@ func findDevice(timeout time.Duration) (bluetooth.Device, error) {
 	resultCh := make(chan bluetooth.ScanResult, 1)
 	errCh := make(chan error, 1)
 
+	// StopScan must run exactly once: a second call (from a duplicate
+	// discovery event, or the timeout racing a match) blocks or panics.
+	var stopOnce sync.Once
+	stopScan := func() { stopOnce.Do(func() { adapter.StopScan() }) }
+
 	go func() {
 		err := adapter.Scan(func(a *bluetooth.Adapter, result bluetooth.ScanResult) {
 			if result.LocalName() == deviceName {
-				a.StopScan()
-				resultCh <- result
+				stopScan()
+				select {
+				case resultCh <- result:
+				default:
+				}
 			}
 		})
 		if err != nil {
@@ -353,7 +436,7 @@ func findDevice(timeout time.Duration) (bluetooth.Device, error) {
 	case err := <-errCh:
 		return bluetooth.Device{}, err
 	case <-time.After(timeout):
-		adapter.StopScan()
+		stopScan()
 		return bluetooth.Device{}, fmt.Errorf(
 			"could not find a BLE device named %q within %s; is it powered on and in range?",
 			deviceName, timeout)
